@@ -47,3 +47,11 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+
+# EvoDiffMol: keep .gitkeep placeholders
+!EvoDiffMol/assets/checkpoints/.gitkeep
+
+# EvoDiffMol large data (keep Python utilities only)
+EvoDiffMol/datasets/*/processed/
+EvoDiffMol/datasets/*/raw/
+EvoDiffMol/datasets/dataset_configs_output.txt
