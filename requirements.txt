@@ -1,0 +1,20 @@
+numpy>=1.2.4
+scipy>=1.7
+pandas>=1.1
+joblib>=1.0.1
+SQLAlchemy>=1.4.23
+rdkit>=2021.3.3
+scikit-learn
+matplotlib
+seaborn
+
+# MMPolymer / Model dependencies discovered via dynamic probing
+torch
+unicore @ git+https://github.com/dptech-corp/Uni-Core.git@ace6fae1c8479a9751f2bb1e1d6e4047427bc134
+transformers
+lmdb
+regex
+tqdm
+tensorboardX
+wandb
+PyYAML

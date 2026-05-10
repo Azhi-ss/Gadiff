@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.conda/
+
+# Model checkpoints & large data
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.pkl
+*.h5
+*.npz
+
+# Datasets (processed data)
+datasets/*/processed/
+datasets/*/raw/
+
+# Output directories
+ga_output*/
+logs*/
+output*/
+outputs/
+results/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
