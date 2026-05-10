@@ -161,6 +161,10 @@ class EGDFragmentMutator:
         Torch device string (default 'cpu').
     t_prime : int
         Default noise depth for forward diffusion (default 250).
+    ad_checker : ApplicabilityDomain, optional
+        Filters generated fragments by similarity to the reference DNA pool.
+        Fragments below threshold are discarded to avoid OOD MMPolymer
+        predictions. When None, no domain filtering is applied.
     """
 
     def __init__(
@@ -168,14 +172,17 @@ class EGDFragmentMutator:
         diffusion_model: Any,  # MDMFullDP instance (or None for degraded mode)
         device: str = "cpu",
         t_prime: int = 250,
+        ad_checker: Any | None = None,  # ApplicabilityDomain or None
     ) -> None:
         self.model = diffusion_model
         self.device = torch.device(device)
         self.t_prime = t_prime
         self.num_atom_types = NUM_ATOM_TYPES
         self.atom_feature_dim = ATOM_FEATURE_DIM
-        self.model.eval()
-        self.model.to(self.device)
+        self.ad_checker = ad_checker
+        if self.model is not None:
+            self.model.eval()
+            self.model.to(self.device)
 
     # -- Public API -----------------------------------------------------------
 
@@ -206,7 +213,8 @@ class EGDFragmentMutator:
             smiles_out = self._data_to_smiles(data_denoised)
             if smiles_out is None:
                 return []
-            return self._extract_fragments(smiles_out)
+            fragments = self._extract_fragments(smiles_out)
+            return self._apply_ad_filter(fragments)
         except Exception:
             logger.warning("EGD mutation failed for %s", seed_smiles, exc_info=True)
             return []
@@ -247,7 +255,8 @@ class EGDFragmentMutator:
             smiles_out = self._data_to_smiles(chimeric_denoised)
             if smiles_out is None:
                 return []
-            return self._extract_fragments(smiles_out)
+            fragments = self._extract_fragments(smiles_out)
+            return self._apply_ad_filter(fragments)
         except Exception:
             logger.warning(
                 "EGD crossover failed for %s / %s", smi1, smi2, exc_info=True
@@ -569,3 +578,12 @@ class EGDFragmentMutator:
         except Exception:
             logger.warning("BRICS decomposition failed for %s", smiles, exc_info=True)
             return []
+
+    def _apply_ad_filter(self, fragments: list[str]) -> list[str]:
+        """Filter fragments through the applicability domain checker.
+
+        When no ad_checker is configured, all fragments pass through.
+        """
+        if self.ad_checker is None or not fragments:
+            return fragments
+        return self.ad_checker.filter_in_domain(fragments)

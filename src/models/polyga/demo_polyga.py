@@ -50,6 +50,8 @@ class DEMOPolyGA:
         noise_start: int = 300,
         noise_end: int = 150,
         random_seed: int = 42,
+        ad_checker: Any | None = None,  # ApplicabilityDomain or None
+        ood_penalty_weight: float = 0.5,
     ) -> None:
         """
         Args:
@@ -68,6 +70,10 @@ class DEMOPolyGA:
             noise_start: Initial noise level t'.
             noise_end: Final noise level t'.
             random_seed: Random seed.
+            ad_checker: ApplicabilityDomain checker. When set, fitness is
+                penalized by domain_score for OOD polymers. None disables.
+            ood_penalty_weight: How strongly to penalize OOD fitness.
+                0.0 = no penalty, 1.0 = full penalty (fitness * domain_score).
         """
         self.egd_mutator = egd_mutator
         self.saes_selector = saes_selector
@@ -79,6 +85,8 @@ class DEMOPolyGA:
         self.p_c_ratio = p_c_ratio
         self.noise_start = noise_start
         self.noise_end = noise_end
+        self.ad_checker = ad_checker
+        self.ood_penalty_weight = ood_penalty_weight
         self._rng = np.random.default_rng(random_seed)
 
         # Internal state
@@ -269,20 +277,39 @@ class DEMOPolyGA:
     # ------------------------------------------------------------------
 
     def _score(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply fingerprint, prediction, then fitness."""
+        """Apply fingerprint, prediction, fitness, then OOD penalty."""
         if len(df) == 0:
             return df
         try:
             df_copy = df.copy()
             df_fp, fp_headers = self.fingerprint_function(df_copy)
             df_pred = self.predict_function(df_fp, fp_headers, None)
-            return df_pred
+            return self._apply_ood_penalty(df_pred)
         except Exception:
-            # Fallback: assign random fitness
             df_out = df.copy()
             fitness_vals = self._rng.random(len(df_out)) * 10.0
             df_out["fitness"] = fitness_vals
-            return df_out
+            return self._apply_ood_penalty(df_out)
+
+    def _apply_ood_penalty(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Penalize fitness for out-of-domain polymers.
+
+        fitness *= 1.0 - ood_penalty_weight * (1.0 - domain_score)
+        In-domain (score=1.0) → no penalty.
+        OOD (score=0.0) → fitness reduced by ood_penalty_weight.
+        """
+        if self.ad_checker is None:
+            return df
+        if "smiles_string" not in df.columns or len(df) == 0:
+            return df
+        scores = np.array([
+            self.ad_checker.domain_score(s) for s in df["smiles_string"]
+        ])
+        penalty = 1.0 - self.ood_penalty_weight * (1.0 - scores)
+        if "fitness" in df.columns:
+            df = df.copy()
+            df["fitness"] = df["fitness"].values * penalty
+        return df
 
     def _select(self, df: pd.DataFrame, n_select: int) -> pd.DataFrame:
         """Select n_select individuals using SAES or elite fallback."""
