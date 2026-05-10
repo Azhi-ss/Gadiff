@@ -1,43 +1,64 @@
-# Polymer GA Optimization Toolkit
+# PolyDiff-3D: Polymer GA Optimization with Diffusion-Guided Evolution
 
-A comprehensive toolkit for calculating polymer properties, executing genetic algorithm (GA) evolutionary optimizations, and generating related scientific visualizations.
+A comprehensive toolkit for polymer property prediction and genetic algorithm (GA) evolutionary optimization, enhanced with diffusion-model-guided genetic operators.
 
-## 🚀 Overview
+## Overview
 
-This repository integrates tools and models for molecular design:
-- **`src/models/polyga`**: The core Polymer Genetic Algorithm library.
-- **`src/models/MMPolymer`**: Pre-trained machine learning models for property prediction (e.g., Dielectric Constant (DC) and Glass Transition Temperature (Tg)).
-- **`src/optimization`**: Pipeline scripts to run GA experiments, perform cross-over, mutations, and trace the evolutionary trajectory.
-- **`scripts/`**: Utilities for integrating the models, cleaning training datasets, and processing large data outputs.
+- **`src/models/polyga`** — Core Polymer Genetic Algorithm library with EGD noise-space mutation and DEMO three-population co-evolution
+- **`src/models/MMPolymer`** — Transformer-based property prediction for linear polymers (Dielectric Constant, Glass Transition Temperature)
+- **`src/optimization`** — GA experiment pipelines, crossover, mutation, and evolutionary trajectory visualization
+- **`scripts/`** — Integration utilities, data processing, and fragment pregeneration
 
-## 📂 Repository Structure
+### New: Diffusion-Guided Genetic Operators
 
-- **`src/`**: Core logic including models (`models/polyga`, `models/MMPolymer`) and optimization workflows.
-- **`scripts/`**: Standalone automation, data processing, and integration scripts.
-- **`data/`**: Core curated datasets (vocabulary, seed databases of fragments/SMILES).
-- **`examples/`**: Demonstration structural representations (e.g., POSCAR configs) and baseline model outputs.
+| Module | Description |
+|--------|-------------|
+| `diffusion_mutator.py` | EGD noise-space mutation/crossover — mutates fragments in 3D continuous space rather than random ID replacement |
+| `saes_selector.py` | Structure-Aware Environmental Selection — maintains diversity via composite fingerprint + shape distance |
+| `demo_polyga.py` | Three-population co-evolution (Explorer / Refiner / Elite Archive) with adaptive noise scheduling |
+| `validate_linear_polymer()` | Linear polymer constraint — MMPolymer requires exactly 2 `[*]` endpoints |
 
-## 📦 Installation & Requirements
+## Installation
 
-Ensure you are using an environment optimized for chemoinformatics and deep learning (e.g. Conda). The key dependencies typically include:
-
-- Python 3.8+
-- PyTorch
-- RDKit
-- NumPy, pandas, SciPy, scikit-learn
-- SQLAlchemy
-- Matplotlib, Seaborn
-
-See `requirements.txt` for specific version pinning.
-
-## 💡 Quick Start
-
-Before running the GA optimisation, verify the integration components.
-Then execute evolutionary visualisation tracking (from initial random generation to sweet-spot convergence):
 ```bash
-python src/optimization/run_optimization.py
+pip install -r requirements.txt
 ```
 
-## 📝 License / Citation
-*(Please refer to the LICENSE files found in `src/models` subdirectories for respective licensing info.)*
-# MM-GenePoly
+Key dependencies: Python 3.8+, PyTorch, RDKit, NumPy, pandas, SciPy, SQLAlchemy, Uni-Core.
+
+## Quick Start
+
+```bash
+# Run GA optimization
+python src/optimization/run_optimization.py
+
+# Pregenerate fragments for DNA pool expansion (requires EvoDiffMol checkpoint)
+python scripts/pregenerate_fragments.py --checkpoint /path/to/model.pt --n-molecules 500 --output data/enriched_dna.csv
+```
+
+## Testing
+
+```bash
+# All tests are mock-based — no GPU or model weights required
+pytest tests/ -v
+```
+
+## Repository Structure
+
+```
+├── src/
+│   ├── models/
+│   │   ├── polyga/          # GA core + EGD/SAES/DEMO modules
+│   │   └── MMPolymer/       # Transformer property predictor
+│   └── optimization/        # Experiment pipelines & visualization
+├── scripts/
+│   ├── integration/         # PolyGA-MMPolymer integration
+│   └── pregenerate_fragments.py  # Diffusion fragment generation
+├── tests/                   # 145 mock tests
+├── data/tokenizer/          # Polymer SMILES tokenizer
+└── requirements.txt
+```
+
+## License
+
+Please refer to LICENSE files in `src/models` subdirectories for respective licensing.
