@@ -55,3 +55,4 @@ htmlcov/
 EvoDiffMol/datasets/*/processed/
 EvoDiffMol/datasets/*/raw/
 EvoDiffMol/datasets/dataset_configs_output.txt
+doc/
