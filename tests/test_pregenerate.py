@@ -23,9 +23,11 @@ from scripts.pregenerate_fragments import (
     heavy_atom_count,
     is_valid_fragment,
     merge_with_existing,
+    normalize_fragment_for_polyga,
     parse_args,
     process_molecules,
     read_existing_dna,
+    validate_evodiffmol_checkpoint,
     write_dna_csv,
 )
 
@@ -146,6 +148,17 @@ class TestIsValidFragment:
         assert is_valid_fragment("bad") is False
 
 
+class TestNormalizeFragmentForPolyGA:
+    def test_converts_brics_isotope_stars_to_bi(self) -> None:
+        assert (
+            normalize_fragment_for_polyga("[5*]N(C)C1=CC(=O)C([15*])C=C1")
+            == "[Bi]N(C)C1=CC(=O)C([Bi])C=C1"
+        )
+
+    def test_converts_plain_stars_to_bi(self) -> None:
+        assert normalize_fragment_for_polyga("[*]CC[*]") == "[Bi]CC[Bi]"
+
+
 # ---------------------------------------------------------------------------
 # process_molecules (integration of BRICS + filtering + dedup)
 # ---------------------------------------------------------------------------
@@ -160,6 +173,16 @@ class TestProcessMolecules:
     def test_invalid_molecules_skipped(self) -> None:
         results = process_molecules(["not-a-molecule"])
         assert len(results) == 0
+
+    def test_deduplicates_after_polyga_normalization(self) -> None:
+        with mock.patch(
+            "scripts.pregenerate_fragments.brics_decompose",
+            return_value=["[1*]CCC[8*]", "[5*]CCC[15*]"],
+        ):
+            results = process_molecules(["CC"])
+
+        normalized = [normalize_fragment_for_polyga(s) for s, _ in results]
+        assert normalized == ["[Bi]CCC[Bi]"]
 
     def test_empty_input(self) -> None:
         assert process_molecules([]) == []
@@ -194,7 +217,7 @@ class TestReadExistingDna:
 
 class TestWriteDnaCsv:
     def test_writes_correct_format(self) -> None:
-        fragments: List[Tuple[str, int]] = [("[*]CC[*]", 2), ("[*]CN[*]", 2)]
+        fragments: List[Tuple[str, int]] = [("[1*]CC[8*]", 2), ("[*]CN[*]", 2)]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
             tmp_path = tmp.name
 
@@ -205,9 +228,9 @@ class TestWriteDnaCsv:
                 rows = list(reader)
 
             assert rows[0] == list(DNA_ROW)
-            assert rows[1][1] == "[*]CC[*]"
+            assert rows[1][1] == "[Bi]CC[Bi]"
             assert rows[1][2] == "2"
-            assert rows[2][1] == "[*]CN[*]"
+            assert rows[2][1] == "[Bi]CN[Bi]"
             assert rows[2][2] == "2"
             # IDs should be sequential starting from 1
             assert rows[1][0] == "1"
@@ -278,6 +301,26 @@ class TestMergeWithExisting:
             )
         assert len(merged) == 2
 
+    def test_deduplicates_existing_bi_against_new_brics(self) -> None:
+        existing_csv = io.StringIO(
+            "chromosome_id,chromosome,num_connections\n"
+            "1,[Bi]CC[Bi],2\n"
+        )
+        with mock.patch(
+            "scripts.pregenerate_fragments.open",
+            mock.mock_open(read_data=existing_csv.getvalue()),
+        ):
+            merged = merge_with_existing(
+                "/fake/path.csv",
+                [("[1*]CC[8*]", 2), ("[1*]CN[8*]", 2)],
+            )
+
+        assert len(merged) == 2
+        assert [normalize_fragment_for_polyga(s) for s, _ in merged] == [
+            "[Bi]CC[Bi]",
+            "[Bi]CN[Bi]",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # generate_molecules (EvoDiffMol interaction, mocked)
@@ -297,9 +340,29 @@ class TestGenerateMolecules:
 
         result = generate_molecules("/fake/checkpoint.pt", 5)
 
-        mock_generator_cls.assert_called_once_with(checkpoint_path="/fake/checkpoint.pt")
+        _, kwargs = mock_generator_cls.call_args
+        assert kwargs["checkpoint_path"] == "/fake/checkpoint.pt"
+        assert kwargs["model_config"].endswith("EvoDiffMol/configs/general_without_h.yml")
+        assert kwargs["ga_config"].endswith("EvoDiffMol/ga_config/moses_production.yml")
+        assert kwargs["dataset"] == []
         mock_instance.generate.assert_called_once_with(n=5)
         assert result == ["CCO", "CCN"]
+
+    @mock.patch("scripts.pregenerate_fragments.EVODIFFMOL_AVAILABLE", True)
+    @mock.patch("scripts.pregenerate_fragments._MoleculeGenerator")
+    def test_uses_optimize_when_generate_api_absent(self, mock_generator_cls: mock.MagicMock) -> None:
+        mock_instance = mock_generator_cls.return_value
+        del mock_instance.generate
+        mock_instance.optimize.return_value = ["CCO"]
+
+        result = generate_molecules("/fake/checkpoint.pt", 5)
+
+        mock_instance.optimize.assert_called_once()
+        _, kwargs = mock_instance.optimize.call_args
+        assert kwargs["target_properties"] == {"qed": 0.9}
+        assert kwargs["population_size"] == 5
+        assert kwargs["generations"] == 0
+        assert result == ["CCO"]
 
     @mock.patch("scripts.pregenerate_fragments.EVODIFFMOL_AVAILABLE", True)
     @mock.patch("scripts.pregenerate_fragments._MoleculeGenerator")
@@ -310,11 +373,44 @@ class TestGenerateMolecules:
 
     @mock.patch("scripts.pregenerate_fragments.EVODIFFMOL_AVAILABLE", True)
     @mock.patch("scripts.pregenerate_fragments._MoleculeGenerator")
+    def test_strict_generation_failure_raises(self, mock_generator_cls: mock.MagicMock) -> None:
+        mock_generator_cls.side_effect = RuntimeError("checkpoint mismatch")
+
+        with pytest.raises(RuntimeError, match="EvoDiffMol generation failed"):
+            generate_molecules("/fake/checkpoint.pt", 5, strict=True)
+
+    @mock.patch("scripts.pregenerate_fragments.EVODIFFMOL_AVAILABLE", True)
+    @mock.patch("scripts.pregenerate_fragments._MoleculeGenerator")
     def test_handles_non_list_generate_return(self, mock_generator_cls: mock.MagicMock) -> None:
         mock_instance = mock_generator_cls.return_value
         mock_instance.generate.return_value = tuple(["CCO"])
         result = generate_molecules("/fake/checkpoint.pt", 1)
         assert result == ["CCO"]
+
+
+class TestValidateEvoDiffMolCheckpoint:
+    @mock.patch("scripts.pregenerate_fragments.torch_load")
+    def test_rejects_mmpolymer_checkpoint(self, mock_torch_load: mock.MagicMock) -> None:
+        mock_torch_load.return_value = {
+            "model": {
+                "PretrainedModel.embeddings.word_embeddings.weight": object(),
+                "classification_head.1.weight": object(),
+            }
+        }
+
+        with pytest.raises(ValueError, match="not an EvoDiffMol diffusion checkpoint"):
+            validate_evodiffmol_checkpoint("/fake/mmpolymer.pt")
+
+    @mock.patch("scripts.pregenerate_fragments.torch_load")
+    def test_accepts_evodiffmol_checkpoint(self, mock_torch_load: mock.MagicMock) -> None:
+        mock_torch_load.return_value = {
+            "model": {
+                "betas": object(),
+                "alphas": object(),
+            }
+        }
+
+        validate_evodiffmol_checkpoint("/fake/evodiffmol.pt")
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +479,13 @@ class TestMainSmoke:
             Path(out_path).unlink(missing_ok=True)
 
     @mock.patch("scripts.pregenerate_fragments.EVODIFFMOL_AVAILABLE", True)
+    @mock.patch("scripts.pregenerate_fragments.validate_evodiffmol_checkpoint")
     @mock.patch("scripts.pregenerate_fragments._MoleculeGenerator")
-    def test_main_with_existing_dna(self, mock_generator_cls: mock.MagicMock) -> None:
+    def test_main_with_existing_dna(
+        self,
+        mock_generator_cls: mock.MagicMock,
+        mock_validate_checkpoint: mock.MagicMock,
+    ) -> None:
         from scripts.pregenerate_fragments import main
 
         mock_instance = mock_generator_cls.return_value

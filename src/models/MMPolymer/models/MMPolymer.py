@@ -3,6 +3,7 @@
 
 import logging
 import os
+from pathlib import Path
 import torch
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
@@ -148,8 +149,12 @@ class MMPolymerModel(BaseUnicoreModel):
         
         # 1D net
         # Prefer explicit local tokenizer files to avoid relying on HF Hub/tokenizer_config.json
-        local_vocab_path = "/root/code/tokenizer_files/vocab.json"
-        local_merges_path = "/root/code/tokenizer_files/merges.txt"
+        tokenizer_dir = Path(os.environ.get(
+            "POLYMER_TOKENIZER_DIR",
+            Path(__file__).resolve().parents[4] / "data" / "tokenizer",
+        ))
+        local_vocab_path = str(tokenizer_dir / "vocab.json")
+        local_merges_path = str(tokenizer_dir / "merges.txt")
         if os.path.isfile(local_vocab_path) and os.path.isfile(local_merges_path):
             self.tokenizer = PolymerSmilesTokenizer(
                 vocab_file=local_vocab_path,

@@ -8,11 +8,16 @@ from typing import List, Optional, Tuple
 import regex as re
 from transformers import AddedToken, PreTrainedTokenizer
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # 本地分词器文件配置
-LOCAL_TOKENIZER_DIR = "/root/code/tokenizer_files"
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+LOCAL_TOKENIZER_DIR = os.environ.get(
+    "POLYMER_TOKENIZER_DIR",
+    str(_REPO_ROOT / "data" / "tokenizer"),
+)
 VOCAB_FILES_NAMES = {
     "vocab_file": "vocab.json",
     "merges_file": "merges.txt",

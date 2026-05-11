@@ -194,7 +194,6 @@ def build_molecule_openbabel(positions, atom_types, dataset_info):
     Returns an RDKit molecule. If Open Babel fails, raise an error instead of falling back.
     """
     from openbabel import openbabel
-    import pybel
     from rdkit import Chem
 
     # Use original positions without fixing

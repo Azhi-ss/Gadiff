@@ -658,6 +658,7 @@ class PolyNation:
         self.num_parents_per_family = num_parents_per_family
         self.num_children_per_family = num_children_per_family
         self.num_families = num_families
+        self.num_chromosomes_initial = num_chromosomes_initial
         if emigration_rate > 0.5:
             logging.info('Emigration rate was {}, switched to 0.5'.format(
                   emigration_rate))
@@ -725,6 +726,7 @@ class PolyNation:
         if narrate:
             logging.info('The {} of {} worked for {} years.'.format(
                self.land.planet.species, self.name, round((time() - st), 4))) 
+        elite_population = self.__elite_survivors()
         st = time()
         families = self.__selection()
         if narrate:
@@ -745,7 +747,8 @@ class PolyNation:
         if narrate:
             logging.info(f'After '
             + f'{round((time() - st), 4)} years they had children.')
-        self.population = self.__log_births(children, parents)
+        next_population = self.__log_births(children, parents)
+        self.population = self.__prepare_next_generation(next_population, elite_population)
         logging.info("Generation {} of {} have all passed away".format(self.generation,
                                                       self.name))
         self.generation += 1
@@ -1147,6 +1150,55 @@ class PolyNation:
                                   }
                                  )
         return pd.DataFrame(population)
+
+    def __elite_survivors(self):
+        """Clone top-scoring polymers into the next generation when configured."""
+        n_elite = int(getattr(self.land, 'elite_retention_count', 0) or 0)
+        if n_elite <= 0 or 'fitness' not in self.population.columns or len(self.population) == 0:
+            return pd.DataFrame()
+        elites = self.population.nlargest(min(n_elite, len(self.population)), 'fitness')
+        clones = []
+        for _, row in elites.iterrows():
+            chromosome_ids = list(row['chromosome_ids'])
+            clones.append({
+                'chromosome_ids': chromosome_ids,
+                'num_chromosomes': len(chromosome_ids),
+                'planetary_id': self.land.planet.uid(),
+                'parent_1_id': row['planetary_id'],
+                'parent_2_id': 0,
+                'smiles_string': row['smiles_string'],
+                'birth_land': self.land.name,
+                'birth_nation': self.name,
+                'birth_planet': self.land.planet.name,
+            })
+        return pd.DataFrame(clones)
+
+    def __prepare_next_generation(self, children_df, elite_df):
+        """Combine children, retained elites, and refill rows up to target size."""
+        frames = [df for df in (elite_df, children_df) if df is not None and len(df) > 0]
+        if frames:
+            next_population = pd.concat(frames, ignore_index=True)
+        else:
+            next_population = pd.DataFrame()
+
+        target_size = int(getattr(self.land, 'target_population_size', 0) or 0)
+        if target_size <= 0:
+            return next_population
+
+        refill_chromosomes = int(
+            getattr(self.land, 'refill_num_chromosomes_initial', self.num_chromosomes_initial)
+            or self.num_chromosomes_initial
+        )
+        attempts = 0
+        while len(next_population) < target_size and attempts < 10:
+            missing = target_size - len(next_population)
+            refill = self.__generate_random_population(missing, refill_chromosomes)
+            if refill is None or len(refill) == 0:
+                attempts += 1
+                continue
+            next_population = pd.concat([next_population, refill], ignore_index=True)
+            attempts += 1
+        return next_population.head(target_size).reset_index(drop=True)
 
 
     def __mating(self, df):

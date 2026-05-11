@@ -404,3 +404,41 @@ class TestEvolve:
         demo.pop_c = [{"smiles_string": "c1ccccc1", "fitness": 10.0}]
         offspring = demo._evolve_c(200)
         assert len(offspring) > 0
+
+
+class TestEGDFragmentMutatorInterface:
+    def test_mutate_uses_fragment_mutator_api(self) -> None:
+        """DEMOPolyGA should work with EGDFragmentMutator's public API."""
+        mutator = MagicMock()
+        mutator.mutate_fragment = MagicMock(return_value=["[*]CCO[*]"])
+        ga = DEMOPolyGA(
+            egd_mutator=mutator,
+            saes_selector=None,
+            predict_function=_make_dummy_predict_function(),
+            fingerprint_function=_make_dummy_fingerprint_function(),
+        )
+
+        mutant = ga._mutate({"smiles_string": "[*]CC[*]", "fitness": 5.0}, 200)
+
+        mutator.mutate_fragment.assert_called_once_with("[*]CC[*]", 200)
+        assert mutant == {"smiles_string": "[*]CCO[*]", "fitness": 0.0}
+
+    def test_crossover_uses_fragment_mutator_api(self) -> None:
+        """DEMOPolyGA should accept list output from EGD crossover."""
+        mutator = MagicMock()
+        mutator.crossover_fragments = MagicMock(return_value=["[*]CCN[*]"])
+        ga = DEMOPolyGA(
+            egd_mutator=mutator,
+            saes_selector=None,
+            predict_function=_make_dummy_predict_function(),
+            fingerprint_function=_make_dummy_fingerprint_function(),
+        )
+
+        child = ga._crossover(
+            {"smiles_string": "[*]CC[*]", "fitness": 5.0},
+            {"smiles_string": "[*]CO[*]", "fitness": 4.0},
+            200,
+        )
+
+        mutator.crossover_fragments.assert_called_once_with("[*]CC[*]", "[*]CO[*]", 200)
+        assert child == {"smiles_string": "[*]CCN[*]", "fitness": 0.0}

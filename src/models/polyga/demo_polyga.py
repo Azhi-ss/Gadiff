@@ -20,6 +20,16 @@ import pandas as pd
 from polyga.saes_selector import SAESSelector
 
 
+def _explicit_method(obj: Any, name: str) -> Optional[Any]:
+    """Return a real method, avoiding MagicMock's auto-created attributes."""
+    method = getattr(obj, name, None)
+    if not callable(method):
+        return None
+    if hasattr(type(obj), name) or name in getattr(obj, "__dict__", {}):
+        return method
+    return None
+
+
 # ---------------------------------------------------------------------------
 # DEMOPolyGA
 # ---------------------------------------------------------------------------
@@ -248,7 +258,13 @@ class DEMOPolyGA:
             try:
                 smi_a = parent_a.get("smiles_string", "")
                 smi_b = parent_b.get("smiles_string", "")
-                child_smi = self.egd_mutator.crossover(smi_a, smi_b, t_prime)
+                crossover_fn = (
+                    _explicit_method(self.egd_mutator, "crossover_fragments")
+                    or self.egd_mutator.crossover
+                )
+                child_smi = crossover_fn(smi_a, smi_b, t_prime)
+                if isinstance(child_smi, list):
+                    child_smi = child_smi[0] if child_smi else None
                 if child_smi:
                     return {"smiles_string": child_smi, "fitness": 0.0}
             except Exception:
@@ -264,7 +280,13 @@ class DEMOPolyGA:
         if self.egd_mutator is not None:
             try:
                 smi = polymer.get("smiles_string", "")
-                new_smi = self.egd_mutator.mutate(smi, t_prime)
+                mutate_fn = (
+                    _explicit_method(self.egd_mutator, "mutate_fragment")
+                    or self.egd_mutator.mutate
+                )
+                new_smi = mutate_fn(smi, t_prime)
+                if isinstance(new_smi, list):
+                    new_smi = new_smi[0] if new_smi else None
                 if new_smi:
                     return {"smiles_string": new_smi, "fitness": 0.0}
             except Exception:

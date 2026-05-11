@@ -36,6 +36,35 @@ python src/optimization/run_optimization.py
 python scripts/pregenerate_fragments.py --checkpoint /path/to/model.pt --n-molecules 500 --output data/enriched_dna.csv
 ```
 
+## Formal PolyGen
+
+The formal PolyGen workflow uses EvoDiffMol-enriched DNA fragments, MMPolymer
+property prediction, and a balanced normalized fitness objective:
+
+```text
+fitness = (tg_norm + dc_norm + sa_norm) / 3
+```
+
+Where higher `Tg` is better, lower `DC` is better, and lower `SA_score` is
+better. The default inputs are:
+
+- DNA: `data/enriched_dna.csv`
+- MMPolymer weights: `/internfs/Zy/polygen_assets/mm_polymer/finetune_data`
+- Tokenizer files: `data/tokenizer/vocab.json` and `data/tokenizer/merges.txt`
+- Uni-Core dictionary: `src/models/MMPolymer/dict.txt`
+
+Validate setup before a formal run:
+
+```bash
+python scripts/validate_polygen_setup.py --repo-root . --weight-dir /internfs/Zy/polygen_assets/mm_polymer/finetune_data
+```
+
+Run the formal optimization entrypoint:
+
+```bash
+PYTHONPATH=src/models:. python src/optimization/run_optimization.py
+```
+
 ## Testing
 
 ```bash

@@ -48,6 +48,12 @@ import logging
 import tempfile
 from joblib import Parallel, delayed
 
+# Repository-local paths. Avoid relying on sibling checkouts such as
+# /root/code/MMPolymer when this package already contains MMPolymer.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODELS_ROOT = REPO_ROOT / "src" / "models"
+MMPOLYMER_PACKAGE_DIR = MODELS_ROOT / "MMPolymer"
+
 # Suppress warnings
 warnings.filterwarnings(action='ignore')
 RDLogger.DisableLog('rdApp.*')
@@ -257,13 +263,26 @@ def process_polymer_smiles(psmiles: str) -> dict:
 
 def load_tokenizer():
     """Load PolymerSmilesTokenizer from MMPolymer."""
-    # Add MMPolymer to path
-    mmpolymer_path = '/root/code/MMPolymer'
-    if mmpolymer_path not in sys.path:
-        sys.path.insert(0, mmpolymer_path)
+    # Add the repository's models directory so `import MMPolymer` works.
+    models_root = str(MODELS_ROOT)
+    if models_root not in sys.path:
+        sys.path.insert(0, models_root)
     
     from MMPolymer.models.PolymerSmilesTokenization import PolymerSmilesTokenizer
     return PolymerSmilesTokenizer.from_pretrained()
+
+
+def _resolve_weight_path(weight_dir: Path | str, property_name: str) -> Path:
+    """Return checkpoint_best.pt for supported MMPolymer checkpoint layouts."""
+    base = Path(weight_dir)
+    candidates = [
+        base / property_name / "checkpoint_best.pt",
+        base / property_name / "ckpt" / property_name / "checkpoint_best.pt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 # ============================================================================
@@ -340,13 +359,12 @@ def run_inference(property_name: str, cache_path: str, weight_path: str,
     results_path_dir = os.path.join(cache_path, f'{property_name}_results')
     os.makedirs(results_path_dir, exist_ok=True)
 
-    # Get dict path relative to MMPolymer
-    mmpolymer_dir = '/root/code/MMPolymer'
-    dict_path = os.path.join(mmpolymer_dir, 'dict.txt')
+    mmpolymer_dir = MMPOLYMER_PACKAGE_DIR
+    dict_path = mmpolymer_dir / 'dict.txt'
     
     cmd = (
-        f"python {mmpolymer_dir}/MMPolymer/infer.py "
-        f"--user-dir {mmpolymer_dir}/MMPolymer "
+        f"{sys.executable} {mmpolymer_dir}/infer.py "
+        f"--user-dir {mmpolymer_dir} "
         f"{cache_path} --task-name {task_name} "
         f"--valid-subset test --results-path {results_path_dir} "
         f"--num-workers 1 --ddp-backend=c10d --batch-size {batch_size} "
@@ -466,7 +484,7 @@ class MMPolymerPredictor:
         """Verify that all required weight files exist."""
         missing = []
         for prop in self.properties:
-            weight_path = self.weight_dir / prop / "ckpt" / prop / "checkpoint_best.pt"
+            weight_path = _resolve_weight_path(self.weight_dir, prop)
             if not weight_path.exists():
                 missing.append(str(weight_path))
         
@@ -574,7 +592,7 @@ class MMPolymerPredictor:
             # Run inference for each property
             predictions = {}
             for property_name in self.properties:
-                weight_path = str(self.weight_dir / property_name / "ckpt" / property_name / "checkpoint_best.pt")
+                weight_path = str(_resolve_weight_path(self.weight_dir, property_name))
                 
                 logger.info(f"Predicting {property_name}...")
                 psmi_list, pred_list = run_inference(

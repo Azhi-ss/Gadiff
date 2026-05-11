@@ -229,6 +229,8 @@ def chromosome_ids_to_smiles(chromosome_ids: list, chromosomes: dict,
     except:
         pass
     SMILES_connected = _finalize_two_star_psmiles(L_mol)
+    if SMILES_connected is None:
+        return None
     
     # Remove explicit hydrogen atoms from SMILES
     # RDKit sometimes generates SMILES with explicit H (e.g., [CH2], [NH2])

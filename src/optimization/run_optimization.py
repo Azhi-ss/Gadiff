@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-正式项目：使用 PolyGA + (可选)MMPolymer，对 BRICS 片段 DNA 进行聚合物进化优化。
+正式项目：使用 PolyGA + MMPolymer，对扩散增强片段 DNA 进行聚合物进化优化。
 
-- DNA 来源：/root/code/BRICS_DNA/fragments_output1_clean.csv -> 转换为本目录 dna_polymers.csv
-- 生成函数：polyga.utils.chromosome_ids_to_smiles
-- 预测器：优先使用 MMPolymer；若权重缺失则启用回退预测器（启发式），保证可运行
+- DNA 来源：data/enriched_dna.csv
+- 生成函数：polyga.enriched_dna.enriched_chromosome_to_psmiles
+- 预测器：必须使用真实 MMPolymer 权重
 """
 from __future__ import annotations
 
@@ -20,12 +20,17 @@ import pandas as pd
 from datetime import datetime
 import shutil
 
-# 将 polyga 源码加入路径
-sys.path.insert(0, '/root/code/polyga')
+# 将仓库内模型源码加入路径
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MODELS_ROOT = REPO_ROOT / 'src' / 'models'
+if str(MODELS_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODELS_ROOT))
 
 from polyga.polygod import PolyPlanet, PolyLand, PolyNation  # type: ignore
 from polyga.selection_schemes import elite  # type: ignore
 from polyga import utils  # type: ignore
+from polyga.enriched_dna import enriched_chromosome_to_psmiles  # type: ignore
+from polyga.sa_score import add_sa_scores  # type: ignore
 
 # 可选 MMPolymer 预测器
 # 延迟导入 MMPolymer 预测器（在 maybe_create_mmpolymer_predictor 内部）
@@ -33,29 +38,32 @@ from polyga import utils  # type: ignore
 
 CONFIG: Dict[str, object] = {
     # 路径
-    'dna_file': 'dna_polymers.csv',
-    'results_dir': 'results_100gen_run',
-    'planet_name': 'BRICSPolyPlanet',
+    'dna_file': 'data/enriched_dna.csv',
+    'results_dir': 'results_polygen_formal',
+    'planet_name': 'PolyGenFormalPlanet',
 
     # MMPolymer 设置
-    'weight_dir': '/internfs/Zy/dataset/finetune_data',
+    'weight_dir': '/internfs/Zy/polygen_assets/mm_polymer/finetune_data',
     'properties': ['Tg', 'DC'],
     'use_gpu': True,
     'batch_size': 128,
     'num_cpus': 1,
+    'allow_heuristic_predictor': False,
 
     # 目标权重（示例：最大化 Tg，最小化 DC）
-    'weight_tg': 0.5,
-    'weight_dc': 0.5,
+    'weight_tg': 1.5,
+    'weight_dc': 1.0,
+    'weight_sa': 1.0,
 
     # GA 参数（正式运行）
     'random_seed': 43,
     'num_generations': 100,
     'population_size': 120,
-    'num_chromosomes_initial': 4,
+    'num_chromosomes_initial': 1,
     'num_families': 20,
     'num_parents_per_family': 3,
     'num_children_per_family': 6,
+    'elite_retention_count': 5,
 
     # 遗传操作参数
     'fraction_mutation': 0.01,
@@ -81,6 +89,15 @@ CONFIG: Dict[str, object] = {
     'tg_q_high': 0.90,
     'dc_q_low': 0.10,
     'dc_q_high': 0.90,
+    'sa_q_low': 0.10,
+    'sa_q_high': 0.90,
+    'tg_gate_soft': 500.0,
+    'tg_gate_hard': 600.0,
+    'dc_gate_soft': 3.0,
+    'dc_gate_hard': 4.0,
+    'sa_gate_soft': 3.0,
+    'sa_gate_hard': 5.0,
+    'gate_floor': 0.10,
     # DC 阈值惩罚：支持 'quantile' 或 'value'
     'dc_penalty_mode': 'quantile',
     'dc_max_quantile': 0.80,
@@ -106,6 +123,16 @@ def _configure_thread_env(max_threads: int) -> None:
         os.environ[var] = str(max_threads)
 
 
+def resolve_dna_path(project_dir: Path, dna_file: str | Path) -> Path:
+    """Resolve and validate the configured DNA CSV path."""
+    dna_path = Path(dna_file)
+    if not dna_path.is_absolute():
+        dna_path = project_dir / dna_path
+    if not dna_path.exists():
+        raise FileNotFoundError(f"DNA file not found: {dna_path}")
+    return dna_path
+
+
 def _linear_schedule(
     current_gen: int,
     start_gen: int,
@@ -124,20 +151,33 @@ def _linear_schedule(
     return start_value + ratio * (end_value - start_value)
 
 
-def create_fitness_function(weight_tg: float = 1.0, weight_dc: float = 0.5) -> Callable[[pd.DataFrame, List[str]], pd.DataFrame]:
-    """构建线性加权+归一化的适应度函数，并对 DC 超阈值施加惩罚。"""
+def create_fitness_function(
+    weight_tg: float | None = None,
+    weight_dc: float | None = None,
+    weight_sa: float | None = None,
+) -> Callable[[pd.DataFrame, List[str]], pd.DataFrame]:
+    """构建高 Tg、低 DC、低 SA 的平衡归一化适应度函数。"""
     # 清空缓存，确保每次运行使用新的基准
     _NORMALIZATION_CACHE.clear()
 
     norm_scheme: str = str(CONFIG.get('fitness_normalization', 'quantile'))
-    tg_q_low: float = float(CONFIG.get('tg_q_low', 0.50))
-    tg_q_high: float = float(CONFIG.get('tg_q_high', 0.90))
-    dc_q_low: float = float(CONFIG.get('dc_q_low', 0.10))
-    dc_q_high: float = float(CONFIG.get('dc_q_high', 0.50))
-    dc_penalty_mode: str = str(CONFIG.get('dc_penalty_mode', 'quantile'))
-    dc_max_quantile: float = float(CONFIG.get('dc_max_quantile', 0.90))
-    dc_max_value: float = float(CONFIG.get('dc_max_value', 9999.0))
-    dc_penalty_factor: float = float(CONFIG.get('dc_penalty_factor', 0.10))
+    weights = {
+        'tg': float(CONFIG.get('weight_tg', 1.0) if weight_tg is None else weight_tg),
+        'dc': float(CONFIG.get('weight_dc', 1.0) if weight_dc is None else weight_dc),
+        'sa': float(CONFIG.get('weight_sa', 1.0) if weight_sa is None else weight_sa),
+    }
+    weight_total = sum(max(v, 0.0) for v in weights.values()) or 1.0
+    q_bounds = {
+        'tg': (float(CONFIG.get('tg_q_low', 0.10)), float(CONFIG.get('tg_q_high', 0.90))),
+        'dc': (float(CONFIG.get('dc_q_low', 0.10)), float(CONFIG.get('dc_q_high', 0.90))),
+        'sa': (float(CONFIG.get('sa_q_low', 0.10)), float(CONFIG.get('sa_q_high', 0.90))),
+    }
+    gate_floor = float(CONFIG.get('gate_floor', 0.10))
+    gate_thresholds = {
+        'tg': (float(CONFIG.get('tg_gate_soft', 500.0)), float(CONFIG.get('tg_gate_hard', 600.0))),
+        'dc': (float(CONFIG.get('dc_gate_soft', 3.0)), float(CONFIG.get('dc_gate_hard', 4.0))),
+        'sa': (float(CONFIG.get('sa_gate_soft', 3.0)), float(CONFIG.get('sa_gate_hard', 5.0))),
+    }
 
     def _clip01(x: float) -> float:
         return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
@@ -147,85 +187,100 @@ def create_fitness_function(weight_tg: float = 1.0, weight_dc: float = 0.5) -> C
             return 0.0
         return num / den
 
-    def _normalize(df_in: pd.DataFrame, generation: int | None = None) -> Tuple[pd.Series, pd.Series, float]:
+    def _bounds(series: pd.Series, key: str) -> tuple[float, float]:
+        q_low, q_high = q_bounds[key]
+        if norm_scheme == 'quantile':
+            low = float(series.dropna().quantile(q_low)) if series.notna().any() else 0.0
+            high = float(series.dropna().quantile(q_high)) if series.notna().any() else 1.0
+        else:
+            low = float(series.min()) if series.notna().any() else 0.0
+            high = float(series.max()) if series.notna().any() else 1.0
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            return 0.0, 1.0
+        return low, high
+
+    def _normalize(df_in: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
         tg_series = pd.to_numeric(df_in.get('Tg'), errors='coerce')
         dc_series = pd.to_numeric(df_in.get('DC'), errors='coerce')
+        sa_series = pd.to_numeric(df_in.get('SA_score'), errors='coerce')
 
-        # 只要缓存已填充，就使用缓存（锁定基准），不再依赖 generation 字段
-        if all(
-            key in _NORMALIZATION_CACHE
-            for key in ('tg_L', 'tg_U', 'dc_L', 'dc_U', 'dc_max_th')
-        ):
-            tg_L = _NORMALIZATION_CACHE['tg_L']
-            tg_U = _NORMALIZATION_CACHE['tg_U']
-            dc_L = _NORMALIZATION_CACHE['dc_L']
-            dc_U = _NORMALIZATION_CACHE['dc_U']
-            dc_max_th = _NORMALIZATION_CACHE['dc_max_th']
-        else:
-            if norm_scheme == 'quantile':
-                tg_L = tg_series.quantile(tg_q_low)
-                tg_U = tg_series.quantile(tg_q_high)
-                dc_L = dc_series.quantile(dc_q_low)
-                dc_U = dc_series.quantile(dc_q_high)
-            else:  # 'minmax'
-                tg_L, tg_U = float(tg_series.min()), float(tg_series.max())
-                dc_L, dc_U = float(dc_series.min()), float(dc_series.max())
+        if not all(key in _NORMALIZATION_CACHE for key in ('tg_L', 'tg_U', 'dc_L', 'dc_U', 'sa_L', 'sa_U')):
+            tg_L, tg_U = _bounds(tg_series, 'tg')
+            dc_L, dc_U = _bounds(dc_series, 'dc')
+            sa_L, sa_U = _bounds(sa_series, 'sa')
+            _NORMALIZATION_CACHE.update({
+                'tg_L': tg_L,
+                'tg_U': tg_U,
+                'dc_L': dc_L,
+                'dc_U': dc_U,
+                'sa_L': sa_L,
+                'sa_U': sa_U,
+            })
+        tg_L = _NORMALIZATION_CACHE['tg_L']
+        tg_U = _NORMALIZATION_CACHE['tg_U']
+        dc_L = _NORMALIZATION_CACHE['dc_L']
+        dc_U = _NORMALIZATION_CACHE['dc_U']
+        sa_L = _NORMALIZATION_CACHE['sa_L']
+        sa_U = _NORMALIZATION_CACHE['sa_U']
 
-            if not np.isfinite(tg_L) or not np.isfinite(tg_U) or tg_U <= tg_L:
-                tg_L = float(pd.Series(tg_series.dropna()).quantile(0.25)) if tg_series.notna().any() else 0.0
-                tg_U = float(pd.Series(tg_series.dropna()).quantile(0.75)) if tg_series.notna().any() else 1.0
-                if tg_U <= tg_L:
-                    tg_L, tg_U = 0.0, 1.0
-            if not np.isfinite(dc_L) or not np.isfinite(dc_U) or dc_U <= dc_L:
-                dc_L = float(pd.Series(dc_series.dropna()).quantile(0.25)) if dc_series.notna().any() else 0.0
-                dc_U = float(pd.Series(dc_series.dropna()).quantile(0.75)) if dc_series.notna().any() else 1.0
-                if dc_U <= dc_L:
-                    dc_L, dc_U = 0.0, 1.0
+        # 归一化：Tg 越大越好，DC/SA 越小越好
+        tg_norm = ((tg_series - tg_L) / (tg_U - tg_L)).apply(lambda v: _clip01(float(v)) if pd.notna(v) else np.nan)
+        dc_norm = ((dc_U - dc_series) / (dc_U - dc_L)).apply(lambda v: _clip01(float(v)) if pd.notna(v) else np.nan)
+        sa_norm = ((sa_U - sa_series) / (sa_U - sa_L)).apply(lambda v: _clip01(float(v)) if pd.notna(v) else np.nan)
 
-            if dc_penalty_mode == 'quantile':
-                dc_max_th = float(dc_series.quantile(dc_max_quantile)) if dc_series.notna().any() else float('inf')
+        return tg_norm, dc_norm, sa_norm
+
+    def _soft_upper_gate(series: pd.Series, key: str) -> pd.Series:
+        soft, hard = gate_thresholds[key]
+        values = pd.to_numeric(series, errors='coerce')
+        if hard <= soft:
+            return pd.Series(1.0, index=values.index)
+        gates = []
+        for value in values:
+            if pd.isna(value):
+                gates.append(0.0)
+            elif float(value) <= soft:
+                gates.append(1.0)
+            elif float(value) >= hard:
+                gates.append(gate_floor)
             else:
-                dc_max_th = dc_max_value
-            if not np.isfinite(dc_max_th):
-                dc_max_th = float('inf')
-
-            _NORMALIZATION_CACHE['tg_L'] = float(tg_L)
-            _NORMALIZATION_CACHE['tg_U'] = float(tg_U)
-            _NORMALIZATION_CACHE['dc_L'] = float(dc_L)
-            _NORMALIZATION_CACHE['dc_U'] = float(dc_U)
-            _NORMALIZATION_CACHE['dc_max_th'] = float(dc_max_th)
-
-        dc_max_th = _NORMALIZATION_CACHE['dc_max_th']
-
-        # 归一化：Tg 越大越好，DC 越小越好
-        tg_norm = (tg_series - tg_L).apply(lambda v: _clip01(_safe_div(float(v), 1.0)) if False else _clip01(_safe_div(float(v - tg_L), float(tg_U - tg_L))))
-        dc_norm = (dc_U - dc_series).apply(lambda v: _clip01(_safe_div(float(v), float(dc_U - dc_L))))
-
-        return tg_norm, dc_norm, dc_max_th
+                ratio = (float(value) - soft) / (hard - soft)
+                gates.append(1.0 - ratio * (1.0 - gate_floor))
+        return pd.Series(gates, index=values.index, dtype=float)
 
     def fitness_function(df: pd.DataFrame, fp_headers: List[str]) -> pd.DataFrame:
-        # 计算当前群体的归一化与阈值
-        generation = int(df['generation'].iloc[0]) if 'generation' in df.columns and not df['generation'].isna().all() else 0
-        tg_norm, dc_norm, dc_max_th = _normalize(df, generation)
+        if 'SA_score' not in df.columns and 'smiles_string' in df.columns:
+            df = add_sa_scores(df)
+        else:
+            df = df.copy()
+        tg_norm, dc_norm, sa_norm = _normalize(df)
+        df['tg_norm'] = tg_norm
+        df['dc_norm'] = dc_norm
+        df['sa_norm'] = sa_norm
+        df['tg_gate'] = _soft_upper_gate(df['Tg'], 'tg')
+        df['dc_gate'] = _soft_upper_gate(df['DC'], 'dc')
+        df['sa_gate'] = _soft_upper_gate(df['SA_score'], 'sa')
+        df['fitness_gate'] = df['tg_gate'] * df['dc_gate'] * df['sa_gate']
 
         scores: List[float] = []
+        base_scores: List[float] = []
         for idx, row in df.iterrows():
             tg = row.get('Tg', np.nan)
             dc = row.get('DC', np.nan)
-            if pd.isna(tg) or pd.isna(dc):
+            sa = row.get('SA_score', np.nan)
+            if pd.isna(tg) or pd.isna(dc) or pd.isna(sa):
+                base_scores.append(np.nan)
                 scores.append(-9.99e8)
                 continue
             tgn = float(tg_norm.loc[idx]) if np.isfinite(tg_norm.loc[idx]) else 0.0
             dcn = float(dc_norm.loc[idx]) if np.isfinite(dc_norm.loc[idx]) else 0.0
-            fit = float(weight_tg) * tgn + float(weight_dc) * dcn
-            # DC 超阈值惩罚（乘法缩放）
-            try:
-                if float(dc) > dc_max_th:
-                    fit *= dc_penalty_factor
-            except Exception:
-                pass
+            san = float(sa_norm.loc[idx]) if np.isfinite(sa_norm.loc[idx]) else 0.0
+            base_fit = (weights['tg'] * tgn + weights['dc'] * dcn + weights['sa'] * san) / weight_total
+            fit = base_fit * float(df.loc[idx, 'fitness_gate'])
+            base_scores.append(base_fit)
             scores.append(fit)
 
+        df['base_fitness'] = base_scores
         df['fitness'] = scores
         return df
 
@@ -318,30 +373,40 @@ def _summarize_generation_to_csv(db_path: Path, gen: int, out_csv: Path, cfg: Di
             'smiles': r['smiles_string'],
             'Tg': props.get('Tg', None),
             'DC': props.get('DC', None),
+            'SA_score': props.get('SA_score', None),
+            'tg_norm': props.get('tg_norm', None),
+            'dc_norm': props.get('dc_norm', None),
+            'sa_norm': props.get('sa_norm', None),
+            'base_fitness': props.get('base_fitness', None),
+            'fitness_gate': props.get('fitness_gate', None),
+            'tg_gate': props.get('tg_gate', None),
+            'dc_gate': props.get('dc_gate', None),
+            'sa_gate': props.get('sa_gate', None),
         })
     df = pd.DataFrame(recs)
-    df = df[df['Tg'].notna() & df['DC'].notna()].copy()
+    if 'SA_score' not in df.columns or df['SA_score'].isna().any():
+        df = add_sa_scores(df.rename(columns={'smiles': 'smiles_string'})).rename(columns={'smiles_string': 'smiles'})
+    df = df[df['Tg'].notna() & df['DC'].notna() & df['SA_score'].notna()].copy()
     if len(df) == 0:
         con.close()
         return
     weight_tg = float(cfg.get('weight_tg', 1.0))
     weight_dc = float(cfg.get('weight_dc', 0.5))
+    weight_sa = float(cfg.get('weight_sa', 0.5))
+    weight_total = max(weight_tg, 0.0) + max(weight_dc, 0.0) + max(weight_sa, 0.0) or 1.0
     norm_scheme = str(cfg.get('fitness_normalization', 'quantile'))
     tg_q_low = float(cfg.get('tg_q_low', 0.50))
     tg_q_high = float(cfg.get('tg_q_high', 0.90))
     dc_q_low = float(cfg.get('dc_q_low', 0.10))
     dc_q_high = float(cfg.get('dc_q_high', 0.50))
-    dc_penalty_mode = str(cfg.get('dc_penalty_mode', 'quantile'))
-    dc_max_quantile = float(cfg.get('dc_max_quantile', 0.90))
-    dc_max_value = float(cfg.get('dc_max_value', 9999.0))
-    dc_penalty_factor = float(cfg.get('dc_penalty_factor', 0.10))
     tg = pd.to_numeric(df['Tg'], errors='coerce')
     dc = pd.to_numeric(df['DC'], errors='coerce')
     radius = int(cfg.get('fingerprint_radius', 2))
     nbits = int(cfg.get('fingerprint_nbits', 1024))
     use_chirality = bool(cfg.get('fingerprint_use_chirality', True))
+    sa = pd.to_numeric(df['SA_score'], errors='coerce')
     if gen == 0 or not all(
-        key in _NORMALIZATION_CACHE for key in ('tg_L', 'tg_U', 'dc_L', 'dc_U', 'dc_max_th')
+        key in _NORMALIZATION_CACHE for key in ('tg_L', 'tg_U', 'dc_L', 'dc_U', 'sa_L', 'sa_U')
     ):
         # 仅在 Gen0 计算基准，后续代数强制使用缓存
         if gen != 0:
@@ -351,40 +416,44 @@ def _summarize_generation_to_csv(db_path: Path, gen: int, out_csv: Path, cfg: Di
             tg_U = float(tg.dropna().quantile(tg_q_high)) if tg.notna().any() else 1.0
             dc_L = float(dc.dropna().quantile(dc_q_low)) if dc.notna().any() else 0.0
             dc_U = float(dc.dropna().quantile(dc_q_high)) if dc.notna().any() else 1.0
+            sa_L = float(sa.dropna().quantile(float(cfg.get('sa_q_low', 0.10)))) if sa.notna().any() else 0.0
+            sa_U = float(sa.dropna().quantile(float(cfg.get('sa_q_high', 0.90)))) if sa.notna().any() else 1.0
         else:
             tg_L = float(tg.min()) if tg.notna().any() else 0.0
             tg_U = float(tg.max()) if tg.notna().any() else 1.0
             dc_L = float(dc.min()) if dc.notna().any() else 0.0
             dc_U = float(dc.max()) if dc.notna().any() else 1.0
+            sa_L = float(sa.min()) if sa.notna().any() else 0.0
+            sa_U = float(sa.max()) if sa.notna().any() else 1.0
         if not np.isfinite(tg_L) or not np.isfinite(tg_U) or tg_U <= tg_L:
             tg_L, tg_U = 0.0, 1.0
         if not np.isfinite(dc_L) or not np.isfinite(dc_U) or dc_U <= dc_L:
             dc_L, dc_U = 0.0, 1.0
-        if dc_penalty_mode == 'quantile':
-            dc_p90 = float(dc.dropna().quantile(dc_max_quantile)) if dc.notna().any() else float('inf')
-        else:
-            dc_p90 = dc_max_value
-        if not np.isfinite(dc_p90):
-            dc_p90 = float('inf')
+        if not np.isfinite(sa_L) or not np.isfinite(sa_U) or sa_U <= sa_L:
+            sa_L, sa_U = 0.0, 1.0
         _NORMALIZATION_CACHE['tg_L'] = tg_L
         _NORMALIZATION_CACHE['tg_U'] = tg_U
         _NORMALIZATION_CACHE['dc_L'] = dc_L
         _NORMALIZATION_CACHE['dc_U'] = dc_U
-        _NORMALIZATION_CACHE['dc_max_th'] = dc_p90
+        _NORMALIZATION_CACHE['sa_L'] = sa_L
+        _NORMALIZATION_CACHE['sa_U'] = sa_U
     else:
         tg_L = _NORMALIZATION_CACHE['tg_L']
         tg_U = _NORMALIZATION_CACHE['tg_U']
         dc_L = _NORMALIZATION_CACHE['dc_L']
         dc_U = _NORMALIZATION_CACHE['dc_U']
-        dc_p90 = _NORMALIZATION_CACHE['dc_max_th']
+        sa_L = _NORMALIZATION_CACHE['sa_L']
+        sa_U = _NORMALIZATION_CACHE['sa_U']
     tg_den = tg_U - tg_L
     dc_den = dc_U - dc_L
+    sa_den = sa_U - sa_L
     tg_norm = ((tg - tg_L) / tg_den if tg_den != 0 else pd.Series(0.0, index=tg.index)).clip(0.0, 1.0)
     dc_norm = ((dc_U - dc) / dc_den if dc_den != 0 else pd.Series(0.0, index=dc.index)).clip(0.0, 1.0)
-    fitness_base = weight_tg * tg_norm + weight_dc * dc_norm
-    penalized = dc > dc_p90
-    fitness = fitness_base.copy()
-    fitness.loc[penalized] = fitness.loc[penalized] * dc_penalty_factor
+    sa_norm = ((sa_U - sa) / sa_den if sa_den != 0 else pd.Series(0.0, index=sa.index)).clip(0.0, 1.0)
+    fitness = (weight_tg * tg_norm + weight_dc * dc_norm + weight_sa * sa_norm) / weight_total
+    df['tg_norm'] = tg_norm
+    df['dc_norm'] = dc_norm
+    df['sa_norm'] = sa_norm
 
     # 计算并持久化塔尼莫相似度矩阵
     fp_matrix, valid_idx = _compute_morgan_fingerprints(df['smiles'], radius, nbits, use_chirality)
@@ -421,21 +490,28 @@ def _summarize_generation_to_csv(db_path: Path, gen: int, out_csv: Path, cfg: Di
     def stat(s: pd.Series) -> Dict[str, float]:
         s = s.dropna().astype(float)
         if s.empty:
-            return {'mean': float('nan'), 'median': float('nan'), 'p75': float('nan'), 'max': float('nan')}
+            return {'mean': float('nan'), 'median': float('nan'), 'p75': float('nan'), 'min': float('nan'), 'max': float('nan')}
         return {
             'mean': float(s.mean()),
             'median': float(s.quantile(0.5)),
             'p75': float(s.quantile(0.75)),
+            'min': float(s.min()),
             'max': float(s.max()),
         }
     fs = stat(fitness)
     ts = stat(tg)
     ds = stat(dc)
+    ss = stat(sa)
     best_idx = int(fitness.idxmax())
     best_row = {
         'best_fitness': float(fitness.loc[best_idx]) if pd.notna(fitness.loc[best_idx]) else np.nan,
         'best_tg': float(tg.loc[best_idx]) if pd.notna(tg.loc[best_idx]) else np.nan,
         'best_dc': float(dc.loc[best_idx]) if pd.notna(dc.loc[best_idx]) else np.nan,
+        'best_sa': float(sa.loc[best_idx]) if pd.notna(sa.loc[best_idx]) else np.nan,
+        'best_tg_norm': float(tg_norm.loc[best_idx]) if pd.notna(tg_norm.loc[best_idx]) else np.nan,
+        'best_dc_norm': float(dc_norm.loc[best_idx]) if pd.notna(dc_norm.loc[best_idx]) else np.nan,
+        'best_sa_norm': float(sa_norm.loc[best_idx]) if pd.notna(sa_norm.loc[best_idx]) else np.nan,
+        'best_fitness_gate': float(df.loc[best_idx, 'fitness_gate']) if 'fitness_gate' in df.columns and pd.notna(df.loc[best_idx, 'fitness_gate']) else np.nan,
         'best_smiles': str(df.loc[best_idx, 'smiles']),
     }
     out_row = {
@@ -452,9 +528,13 @@ def _summarize_generation_to_csv(db_path: Path, gen: int, out_csv: Path, cfg: Di
         'dc_mean': ds['mean'],
         'dc_median': ds['median'],
         'dc_p75': ds['p75'],
+        'dc_min': ds['min'],
         'dc_max': ds['max'],
-        'dc_p90_threshold': None if not np.isfinite(dc_p90) else float(dc_p90),
-        'penalized_ratio': float(penalized.mean()) if len(penalized) > 0 else 0.0,
+        'sa_mean': ss['mean'],
+        'sa_median': ss['median'],
+        'sa_p75': ss['p75'],
+        'sa_min': ss['min'],
+        'sa_max': ss['max'],
         **diversity_stats,
         **best_row,
     }
@@ -472,6 +552,13 @@ def _summarize_generation_to_csv(db_path: Path, gen: int, out_csv: Path, cfg: Di
     header = not out_csv.exists()
     out_df.to_csv(out_csv, mode='a', header=header, index=False)
     con.close()
+
+
+def summarize_generation(db_path: Path, gen: int, out_csv: Path, cfg: Dict[str, object]) -> None:
+    """Write generation summary and propagate failures to the caller."""
+    _summarize_generation_to_csv(db_path, gen, out_csv, cfg)
+
+
 def morgan_fingerprint_function(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """生成 Morgan 指纹，供 PolyGA 进行多样性选择。"""
     radius = int(CONFIG.get('fingerprint_radius', 2))
@@ -494,21 +581,25 @@ def morgan_fingerprint_function(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[st
 
 
 def maybe_create_mmpolymer_predictor(cfg: Dict[str, object]) -> Callable[[pd.DataFrame, List[str], Dict | None], pd.DataFrame]:
-    """优先构建 MMPolymer 预测器；若权重缺失或不可用则回退到启发式预测器。"""
+    """构建真实 MMPolymer 预测器；默认不允许回退到启发式预测器。"""
     weight_dir = Path(str(cfg['weight_dir']))
     properties: List[str] = list(cfg['properties'])  # type: ignore
+    allow_fallback = bool(cfg.get('allow_heuristic_predictor', False))
+    from polyga.mmpolymer_predict import _resolve_weight_path  # type: ignore
 
     # 核心权重路径检查
     missing: List[str] = []
     for prop in properties:
-        expect = weight_dir / prop / 'ckpt' / prop / 'checkpoint_best.pt'
+        expect = _resolve_weight_path(weight_dir, prop)
         if not expect.exists():
             missing.append(str(expect))
 
     if missing:
-        print('未找到 MMPolymer 权重，启用回退预测器：')
-        for m in missing:
-            print('  -', m)
+        msg = "MMPolymer weight files not found:\n" + "\n".join(missing)
+        if not allow_fallback:
+            raise FileNotFoundError(msg)
+        print(msg)
+        print('启用回退预测器。')
         return heuristic_predictor(properties)
 
     try:
@@ -526,6 +617,8 @@ def maybe_create_mmpolymer_predictor(cfg: Dict[str, object]) -> Callable[[pd.Dat
             cleanup_cache=True,
         )
     except Exception as e:  # 兜底保证可运行
+        if not allow_fallback:
+            raise RuntimeError(f'创建 MMPolymer 预测器失败: {e}') from e
         print(f'创建 MMPolymer 预测器失败，使用回退预测器。原因: {e}')
         return heuristic_predictor(properties)
 
@@ -566,38 +659,25 @@ def heuristic_predictor(properties: List[str]) -> Callable[[pd.DataFrame, List[s
     return predict
 
 
-def ensure_dna_exists(project_dir: Path, source_fragments_csv: Path) -> Path:
-    """若 dna_polymers.csv 不存在，则调用 create_dna.py 生成。"""
-    dna_path = project_dir / 'dna_polymers.csv'
-    if dna_path.exists():
-        return dna_path
-    # 调用同目录下的 create_dna.py
-    import subprocess
-    cmd = [sys.executable, str(project_dir / 'create_dna.py')]
-    print('生成 DNA:', ' '.join(cmd))
-    subprocess.run(cmd, check=True)
-    assert dna_path.exists(), 'dna_polymers.csv 未生成'
-    return dna_path
-
-
 def main() -> None:
     print('=' * 70)
     print('PolyGA Optimization (BRICS DNA)')
     print('=' * 70)
 
-    script_dir = Path(__file__).parent
-    os.chdir(script_dir)
+    project_dir = REPO_ROOT
+    os.chdir(project_dir)
+    from scripts.validate_polygen_setup import validate_polygen_setup
+    validate_polygen_setup(project_dir, Path(str(CONFIG['weight_dir'])), project_dir / str(CONFIG['dna_file']))
     os.makedirs(str(CONFIG['results_dir']), exist_ok=True)
 
-    # 确保 DNA 存在（从 BRICS 片段转换）
-    source_fragments = Path('/root/code/BRICS_DNA/brics_fragments.csv')
-    dna_file = ensure_dna_exists(script_dir, source_fragments)
+    dna_file = resolve_dna_path(project_dir, str(CONFIG['dna_file']))
 
     # 预测器与适应度
     predict_fn = maybe_create_mmpolymer_predictor(CONFIG)
     fitness_fn = create_fitness_function(
         weight_tg=float(CONFIG['weight_tg']),
         weight_dc=float(CONFIG['weight_dc']),
+        weight_sa=float(CONFIG['weight_sa']),
     )
 
     _configure_thread_env(CONFIG.get('num_cpus', os.cpu_count()))
@@ -625,7 +705,7 @@ def main() -> None:
     land = PolyLand(
         name='OptimizationLand',
         planet=planet,
-        generative_function=utils.chromosome_ids_to_smiles,
+        generative_function=enriched_chromosome_to_psmiles,
         fitness_function=fitness_fn,
         crossover_position=str(CONFIG['crossover_position']),
         fraction_mutation=float(CONFIG.get('fraction_mutation_start', CONFIG.get('fraction_mutation', 0.25))),
@@ -633,6 +713,9 @@ def main() -> None:
         crossover_sigma_offset=float(CONFIG['crossover_sigma_offset']),
         mutation_sigma_offset=float(CONFIG['mutation_sigma_offset']),
     )
+    land.elite_retention_count = int(CONFIG.get('elite_retention_count', 0))
+    land.target_population_size = int(CONFIG['population_size'])
+    land.refill_num_chromosomes_initial = int(CONFIG['num_chromosomes_initial'])
 
     nation = PolyNation(
         name='OptimizerNation',
@@ -649,6 +732,10 @@ def main() -> None:
     )
 
     print(f"Planet: {CONFIG['planet_name']} | DNA: {dna_file} | Chromosomes: {len(planet.chromosomes)}")
+    print(
+        "Fitness: high Tg, low DC, low SA normalized blend "
+        f"(Tg={CONFIG['weight_tg']}, DC={CONFIG['weight_dc']}, SA={CONFIG['weight_sa']})"
+    )
 
     # 运行进化
     div_start_val = float(CONFIG.get('diversity_similarity_threshold_start', 0.5))
@@ -680,10 +767,7 @@ def main() -> None:
         )
         planet.advance_time()
         db_path = Path(CONFIG['results_dir']) / str(CONFIG['planet_name']) / 'planetary_database.sqlite'
-        try:
-            _summarize_generation_to_csv(db_path, nation.generation - 1, Path(CONFIG['results_dir']) / 'summary.csv', CONFIG)
-        except Exception:
-            pass
+        summarize_generation(db_path, nation.generation - 1, Path(CONFIG['results_dir']) / 'summary.csv', CONFIG)
 
     # 简要结果输出
     db_path = Path(CONFIG['results_dir']) / str(CONFIG['planet_name']) / 'planetary_database.sqlite'

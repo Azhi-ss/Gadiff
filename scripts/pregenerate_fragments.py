@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EVODIFFMOL_ROOT = REPO_ROOT / "EvoDiffMol"
+EVODIFFMOL_MODEL_CONFIG = EVODIFFMOL_ROOT / "configs" / "general_without_h.yml"
+EVODIFFMOL_GA_CONFIG = EVODIFFMOL_ROOT / "ga_config" / "moses_production.yml"
 
 try:
     from evodiffmol import MoleculeGenerator as _MoleculeGenerator
@@ -19,6 +25,11 @@ except ImportError:
 
 from rdkit import Chem
 from rdkit.Chem import BRICS
+
+try:
+    from torch import load as torch_load
+except ImportError:
+    torch_load = None  # type: ignore[assignment]
 
 ALLOWED_ELEMENTS: Set[int] = {6, 7, 8, 9, 16, 17, 35}  # C, N, O, F, S, Cl, Br
 MIN_HEAVY_ATOMS: int = 3
@@ -58,6 +69,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def generate_molecules(
     checkpoint_path: str,
     n_molecules: int,
+    strict: bool = False,
 ) -> List[str]:
     """Generate small molecule SMILES via EvoDiffMol's MoleculeGenerator."""
     if not EVODIFFMOL_AVAILABLE:
@@ -71,15 +83,81 @@ def generate_molecules(
         return []
 
     try:
-        gen = _MoleculeGenerator(checkpoint_path=checkpoint_path)
-        result = gen.generate(n=n_molecules)
+        if strict:
+            validate_evodiffmol_checkpoint(checkpoint_path)
+        gen = _MoleculeGenerator(
+            checkpoint_path=checkpoint_path,
+            model_config=str(EVODIFFMOL_MODEL_CONFIG),
+            ga_config=str(EVODIFFMOL_GA_CONFIG),
+            dataset=[],
+            device="cuda" if _cuda_available() else "cpu",
+            verbose=False,
+        )
+        if hasattr(gen, "generate"):
+            result = gen.generate(n=n_molecules)
+        else:
+            result = gen.optimize(
+                target_properties={"qed": 0.9},
+                population_size=n_molecules,
+                generations=0,
+                verbose=False,
+            )
         return list(result)
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"EvoDiffMol generation failed: {exc}") from exc
         print(
             f"WARNING: EvoDiffMol generation failed: {exc}",
             file=sys.stderr,
         )
         return []
+
+
+def validate_evodiffmol_checkpoint(checkpoint_path: str) -> None:
+    """Fail early when a MMPolymer checkpoint is passed as a diffusion checkpoint."""
+    if torch_load is None:
+        return
+
+    checkpoint = torch_load(checkpoint_path, map_location="cpu", weights_only=False)
+    model_state = checkpoint.get("model") if isinstance(checkpoint, dict) else None
+    if not isinstance(model_state, dict):
+        raise ValueError(
+            f"{checkpoint_path} is not an EvoDiffMol diffusion checkpoint: "
+            "expected a dict with a 'model' state_dict."
+        )
+
+    keys = set(model_state.keys())
+    evodiffmol_markers = {
+        "betas",
+        "alphas",
+        "edge_encoder_global.bond_emb.weight",
+        "model_global.0.bond_emb.weight",
+    }
+    if keys & evodiffmol_markers:
+        return
+
+    mmpolymer_markers = (
+        "PretrainedModel.",
+        "classification_head.",
+        "embed_tokens.",
+    )
+    looks_like_mmpolymer = any(
+        key.startswith(mmpolymer_markers) for key in keys
+    )
+    detail = " It looks like an MMPolymer predictor checkpoint." if looks_like_mmpolymer else ""
+    raise ValueError(
+        f"{checkpoint_path} is not an EvoDiffMol diffusion checkpoint.{detail} "
+        "Use the EvoDiffMol checkpoint such as moses_without_h_80.pt."
+    )
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def brics_decompose(smiles: str) -> List[str]:
@@ -134,6 +212,13 @@ def is_valid_fragment(fragment_smiles: str) -> bool:
     return True
 
 
+def normalize_fragment_for_polyga(fragment_smiles: str) -> str:
+    """Convert BRICS dummy atoms into PolyGA's Bi connection placeholders."""
+    normalized = re.sub(r"\[\d+\*\]", "[Bi]", fragment_smiles)
+    normalized = normalized.replace("[*]", "[Bi]")
+    return normalized
+
+
 def process_molecules(smiles_list: List[str]) -> List[Tuple[str, int]]:
     """BRICS-decompose each molecule, filter fragments, and deduplicate.
 
@@ -146,11 +231,11 @@ def process_molecules(smiles_list: List[str]) -> List[Tuple[str, int]]:
         fragments = brics_decompose(input_smiles)
         for frag in fragments:
             canonical = Chem.MolToSmiles(Chem.MolFromSmiles(frag))
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-
             if is_valid_fragment(canonical):
+                normalized = normalize_fragment_for_polyga(canonical)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
                 valid.append((canonical, TARGET_CONNECTIONS))
 
     return valid
@@ -172,7 +257,7 @@ def write_dna_csv(path: str, fragments: List[Tuple[str, int]]) -> None:
         writer = csv.writer(f)
         writer.writerow(DNA_COLUMNS)
         for idx, (smiles, n_conn) in enumerate(fragments, start=1):
-            writer.writerow([idx, smiles, n_conn])
+            writer.writerow([idx, normalize_fragment_for_polyga(smiles), n_conn])
 
 
 def merge_with_existing(
@@ -191,12 +276,13 @@ def merge_with_existing(
         smiles = row["chromosome"]
         n_conn = int(row["num_connections"])
         combined.append((smiles, n_conn))
-        existing_smiles.add(smiles)
+        existing_smiles.add(normalize_fragment_for_polyga(smiles))
 
     for smiles, n_conn in new_fragments:
-        if smiles not in existing_smiles:
+        normalized = normalize_fragment_for_polyga(smiles)
+        if normalized not in existing_smiles:
             combined.append((smiles, n_conn))
-            existing_smiles.add(smiles)
+            existing_smiles.add(normalized)
 
     return combined
 
@@ -213,10 +299,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             file=sys.stderr,
         )
 
-    generated = generate_molecules(
-        checkpoint_path=args.checkpoint,
-        n_molecules=args.n_molecules,
-    )
+    try:
+        generated = generate_molecules(
+            checkpoint_path=args.checkpoint,
+            n_molecules=args.n_molecules,
+            strict=True,
+        )
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
     if generated:
         print(f"Generated {len(generated)} molecules via EvoDiffMol")
