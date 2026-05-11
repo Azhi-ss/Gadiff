@@ -56,6 +56,9 @@ CONFIG: Dict[str, object] = {
     'weight_sa': 1.0,
 
     # GA 参数（正式运行）
+    # HCEA 三群体协同进化
+    'use_hcea': True,
+
     'random_seed': 43,
     'num_generations': 100,
     'population_size': 120,
@@ -659,6 +662,145 @@ def heuristic_predictor(properties: List[str]) -> Callable[[pd.DataFrame, List[s
     return predict
 
 
+def _run_hcea_loop(
+    planet: Any,
+    land: Any,
+    nation: Any,
+    config: Dict[str, object],
+    predict_fn: Callable,
+    fingerprint_fn: Callable,
+) -> None:
+    """Run DEMO three-population co-evolutionary GA with HCEA + DPES + CBSG.
+
+    1. Bootstrap initial population via PolyNation (gen 0)
+    2. Hand over to DEMOPolyGA for generations 1..N
+    3. Save elite archive results
+    """
+    from setup_diffusion import create_demo_runner
+
+    n_gen = int(config.get('num_generations', 100))
+    pop_size = int(config.get('population_size', 180))
+
+    # ---- Gen 0: bootstrap via traditional PolyNation ----
+    print("\n--- HCEA Bootstrap: Generation 0 (initial population) ---")
+    planet.advance_time()
+    db_path = Path(str(config['results_dir'])) / str(config['planet_name']) / 'planetary_database.sqlite'
+    summarize_generation(db_path, nation.generation - 1, Path(str(config['results_dir'])) / 'summary.csv', config)
+
+    # ---- Build DEMOPolyGA runner ----
+    demo = create_demo_runner(
+        land=land,
+        n_generations=n_gen - 1 if n_gen > 1 else n_gen,
+        population_size=pop_size,
+        random_seed=int(config.get('random_seed', 42)),
+    )
+
+    if demo is None:
+        print("Failed to create DEMOPolyGA runner — falling back to single-population GA")
+
+        for gen in range(1, n_gen):
+            print(f"\n--- Generation {gen + 1}/{n_gen} ---")
+            planet.advance_time()
+            summarize_generation(
+                db_path, nation.generation - 1,
+                Path(str(config['results_dir'])) / 'summary.csv', config,
+            )
+        return
+
+    # Seed DEMO populations with the real polymers from gen 0 bootstrapping
+    _seed_demo_population(demo, planet, land, db_path, config)
+
+    # ---- Run HCEA loop ----
+    print("\n=== HCEA Three-Population Co-Evolution ===")
+    print(f"    Generations: {demo.n_generations} | Population: {demo.population_size}")
+    print(f"    P_A Explorers: {len(demo.pop_a)} | P_B Refiners: {len(demo.pop_b)} | P_C Elite: {len(demo.pop_c)}")
+    print(f"    Noise schedule: t' {demo.noise_start} → {demo.noise_end}")
+    print(f"    AD check: {'enabled' if demo.ad_checker else 'disabled'}")
+
+    try:
+        elites = demo.run()
+    except Exception:
+        print("DEMOPolyGA crashed — falling back to single-population GA")
+        for gen in range(1, n_gen):
+            print(f"\n--- Generation {gen + 1}/{n_gen} ---")
+            planet.advance_time()
+            summarize_generation(db_path, nation.generation - 1, Path(str(config['results_dir'])) / 'summary.csv', config)
+        return
+
+    _save_hcea_results(elites, config)
+    print(f"\nHCEA complete. Elite archive: {len(elites)} candidates")
+
+
+def _seed_demo_population(
+    demo: Any,
+    planet: Any,
+    land: Any,
+    db_path: Path,
+    config: Dict[str, object],
+) -> None:
+    """Seed DEMOPolyGA populations with real polymers from gen 0."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        df = pd.read_sql_query(
+            "SELECT * FROM polymer WHERE generation = 0 ORDER BY fitness DESC",
+            conn,
+        )
+        conn.close()
+    except Exception:
+        return
+
+    if len(df) == 0:
+        return
+
+    pop_size = demo.population_size
+    polymers: list[dict] = []
+    for _, row in df.iterrows():
+        polymers.append({
+            "smiles_string": str(row.get("smiles_string", "")),
+            "fitness": float(row.get("fitness", 0.0)),
+            "chromosome_ids": row.get("str_chromosome_ids", "[]"),
+            "birth_nation": "bootstrap",
+        })
+        if len(polymers) >= pop_size:
+            break
+
+    if len(polymers) == 0:
+        return
+
+    # Fill shortfall with duplicates
+    while len(polymers) < pop_size:
+        polymers.append(dict(polymers[len(polymers) % len(polymers)]))
+
+    size_a = int(pop_size * (1 - demo.p_b_ratio - demo.p_c_ratio))
+    size_b = int(pop_size * demo.p_b_ratio)
+    demo.pop_a = polymers[:size_a]
+    demo.pop_b = polymers[size_a:size_a + size_b]
+    demo.pop_c = polymers[size_a + size_b:size_a + size_b + (pop_size - size_a - size_b)]
+    demo._dna_fragments = set(
+        str(s) for s in land.planet.chromosomes.values()
+    )
+    demo._generation = 1
+    print(f"    Seeded DEMO with {len(polymers)} real polymers from gen 0")
+
+
+def _save_hcea_results(
+    elites: list[dict],
+    config: Dict[str, object],
+) -> None:
+    """Save HCEA elite archive to CSV."""
+    if not elites:
+        return
+    out_dir = Path(str(config['results_dir']))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / 'hcea_elite_archive.csv'
+    df = pd.DataFrame(elites)
+    cols = ["smiles_string", "fitness", "birth_nation"]
+    df[[c for c in cols if c in df.columns]].to_csv(out_path, index=False)
+    print(f"    Elite archive saved: {out_path}")
+
+
 def main() -> None:
     print('=' * 70)
     print('PolyGA Optimization (BRICS DNA)')
@@ -771,6 +913,18 @@ def main() -> None:
     mut_end_val = float(CONFIG.get('fraction_mutation_end', mut_start_val))
     mut_decay_start = int(CONFIG.get('mutation_decay_start_gen', 0))
     mut_decay_end = int(CONFIG.get('mutation_decay_end_gen', int(CONFIG['num_generations']) - 1))
+
+    use_hcea = bool(CONFIG.get('use_hcea', False))
+
+    if use_hcea and land.egd_mutator is not None:
+        _run_hcea_loop(planet, land, nation, CONFIG, predict_fn, morgan_fingerprint_function)
+        db_path = Path(CONFIG['results_dir']) / str(CONFIG['planet_name']) / 'planetary_database.sqlite'
+        print('\n' + '=' * 70)
+        print(f'HCEA 进化完成。精英档案: {land.pop_c_size if hasattr(land, "pop_c_size") else "N/A"} 个候选聚合物')
+        return
+
+    if use_hcea:
+        print("HCEA requested but no EGD mutator loaded — falling back to single-population GA")
 
     for gen in range(int(CONFIG['num_generations'])):
         print(f"\n--- Generation {gen + 1}/{CONFIG['num_generations']} ---")
