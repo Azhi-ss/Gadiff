@@ -731,6 +731,30 @@ def main() -> None:
         random_seed=int(CONFIG['random_seed']),
     )
 
+    # ---------- CFM diffusion mutation setup ----------
+    checkpoint_path = str(CONFIG.get(
+        'evodiffmol_checkpoint',
+        'EvoDiffMol/assets/checkpoints/moses_without_h_80.pt',
+    ))
+    if os.path.exists(checkpoint_path):
+        try:
+            from setup_diffusion import setup_diffusion_modules  # type: ignore
+            land = setup_diffusion_modules(
+                land,
+                checkpoint_path=checkpoint_path,
+                device='cuda' if CONFIG.get('use_gpu', True) else 'cpu',
+                ad_threshold=float(CONFIG.get('ad_threshold', 0.4)),
+                egd_mutation_prob=float(CONFIG.get('egd_mutation_prob', 0.3)),
+                t_prime=int(CONFIG.get('t_prime', 250)),
+                enable_cbsg=bool(CONFIG.get('enable_cbsg', True)),
+            )
+            print(f"CFM diffusion mutation: ENABLED (checkpoint={checkpoint_path})")
+        except Exception as e:
+            print(f"CFM diffusion mutation: FAILED to load ({e}) — falling back to random mutation")
+    else:
+        print(f"CFM diffusion mutation: SKIPPED (checkpoint not found: {checkpoint_path})")
+    # ----------------------------------------------------
+
     print(f"Planet: {CONFIG['planet_name']} | DNA: {dna_file} | Chromosomes: {len(planet.chromosomes)}")
     print(
         "Fitness: high Tg, low DC, low SA normalized blend "
